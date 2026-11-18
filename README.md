@@ -24,11 +24,11 @@ PC나 서버 없이 폰에서 바로 OpenCode Go API에 붙습니다. 키는 기
 
 ## 설치
 
-[Releases](../../releases)에서 `오픈코드Go-1.0.apk`를 받아 설치합니다.
+[Releases](../../releases)에서 `ocgo-mobile-1.0.apk`를 받아 설치합니다.
 (안드로이드 6.0 이상, "출처를 알 수 없는 앱" 허용 필요)
 
 ```bash
-adb install -r 오픈코드Go-1.0.apk
+adb install -r ocgo-mobile-1.0.apk
 ```
 
 첫 실행 후 **OpenCode 콘솔 → API 키**에서 발급한 `oc_sk_...`를 붙여넣으면 끝입니다.
