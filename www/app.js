@@ -132,7 +132,14 @@ function renderActiveSession() {
   const s = activeSession();
   if (!s || !s.messages.length) { renderEmpty(); return; }
   $('messages').innerHTML = '';
-  for (const m of s.messages) renderMessage(m.role, m.content);
+  const src = collectSources(s);
+  const lastIdx = s.messages.length - 1;
+  s.messages.forEach((m, i) => {
+    const bubble = renderMessage(m.role, m.content);
+    if (bubble && m.role === 'assistant' && i === lastIdx && src.length) {
+      bubble.innerHTML = renderMarkdown(autoCite(m.content, src), src) + sourcesHtml(src);
+    }
+  });
   scrollBottom(true);
 }
 
@@ -249,6 +256,8 @@ async function streamChat(userText) {
   persistSessions();
   renderMessage('user', userText);
   state.turnSources = [];
+  state.retried = false;
+  state.abortForRetry = false;
   return runTurn(session, 0);
 }
 
@@ -259,6 +268,43 @@ function reqHeaders() {
     'x-opencode-session': state.sessionId,
     'User-Agent': 'ocgo-mobile/1.0 (android)',
   };
+}
+
+/* ── 생성 반복(degeneration) 감지·정리 ── */
+function repetitionScore(text) {
+  const t = String(text);
+  if (t.length < 200) return 0;
+  const counts = new Map();
+  let max = 0;
+  for (let i = 0; i + 4 <= t.length; i++) {
+    const g = t.slice(i, i + 4);
+    const n = (counts.get(g) || 0) + 1;
+    counts.set(g, n);
+    if (n > max) max = n;
+    if (max >= 14) break;   // 이미 충분히 반복적
+  }
+  return max;
+}
+
+function isDegenerate(text) {
+  return repetitionScore(text) >= 12;
+}
+
+/** 반복이 시작되는 지점에서 잘라낸다 */
+function sanitizeReply(text) {
+  const t = String(text);
+  if (t.length < 200) return { text: t, trimmed: false };
+  const seen = new Map();
+  for (let i = 0; i + 4 <= t.length; i++) {
+    const g = t.slice(i, i + 4);
+    const n = (seen.get(g) || 0) + 1;
+    seen.set(g, n);
+    if (n >= 6) {
+      const cut = Math.max(0, i - 120);
+      return { text: t.slice(0, cut).trim(), trimmed: true };
+    }
+  }
+  return { text: t, trimmed: false };
 }
 
 async function runTurn(session, round) {
@@ -281,6 +327,7 @@ async function runTurn(session, round) {
   const body = {
     model: state.model,
     stream: true,
+    temperature: state.retried ? 0.95 : 0.7,
     messages: [
       ...(sys.filter(Boolean).length ? [{ role: 'system', content: sys.filter(Boolean).join('\n\n') }] : []),
       ...session.messages.slice(-24),
@@ -314,7 +361,7 @@ async function runTurn(session, round) {
         settle();
       });
       const l4 = await ns.addListener('error', (e) => {
-        failTurn(bubble, (e && e.message) || '알 수 없는 오류');
+        if (!state.abortForRetry) failTurn(bubble, (e && e.message) || '알 수 없는 오류');
         settle();
       });
       cleanup = () => { l1 && l1.remove(); l2 && l2.remove(); l3 && l3.remove(); l4 && l4.remove(); };
@@ -326,17 +373,39 @@ async function runTurn(session, round) {
       }
     })();
   });
+
+  if (state.abortForRetry) {
+    state.abortForRetry = false;
+    state.retried = true;
+    bubble.remove();
+    await new Promise((r) => setTimeout(r, 300));
+    return runTurn(session, round);
+  }
 }
 
 function finishTurn(session, text, bubble) {
   bubble.classList.remove('cursor');
-  const body = (text || '').trim();
+  const raw = (text || '').trim();
+  if (isDegenerate(raw) && !state.retried) {
+    state.retried = true;
+    bubble.remove();
+    setTimeout(() => runTurn(session, 0), 300);
+    return;
+  }
+  const san = sanitizeReply(raw);
+  const body = san.text;
+  if (san.trimmed) {
+    toast('응답이 반복되어 잘랐습니다 — 다른 모델을 권장합니다', 3600);
+  }
   if (body) {
     session.messages.push({ role: 'assistant', content: body });
     session.updatedAt = Date.now();
     persistSessions();
     const src = collectSources(session);
-    bubble.innerHTML = renderMarkdown(body, src) + sourcesHtml(src);
+    const cited = autoCite(body, src);
+    bubble.innerHTML = renderMarkdown(cited, src) +
+      (san.trimmed ? '<div class="note">응답이 반복되어 일부만 표시했습니다.</div>' : '') +
+      sourcesHtml(src);
   } else {
     bubble.innerHTML = '<span class="thinking">응답이 비어 있습니다.</span>';
   }
@@ -496,30 +565,73 @@ function collectSources(session) {
       for (const r of (j.results || [])) {
         if (!r || !r.url || seen.has(r.url)) continue;
         seen.add(r.url);
-        out.push({ title: r.title || r.url, url: r.url });
+        out.push({ title: r.title || r.url, url: r.url, snippet: r.snippet || '' });
       }
     } catch (_) {}
   }
   return out;
 }
 
+/* ── 자동 인용: 답변 속 숫자를 출처 스니펫과 대조해 [n]을 붙인다 ── */
+function autoCite(text, sources) {
+  if (!sources.length) return text;
+  if (/\[\d{1,2}\]/.test(text)) return text;   // 모델이 이미 인용했다
+
+  const nums = (s) => (String(s).match(/\d[\d,.]{1,}/g) || []);
+  const lines = String(text).split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line.trim() || line.length < 12) continue;
+    const lineNums = nums(line);
+    if (!lineNums.length) continue;
+
+    const hits = [];
+    for (let si = 0; si < sources.length && hits.length < 2; si++) {
+      const sn = nums(sources[si].snippet || '');
+      if (!sn.length) continue;
+      if (lineNums.some((n) => sn.includes(n))) hits.push(si + 1);
+    }
+    if (hits.length) lines[i] = line.replace(/\s+$/, '') + ' ' + hits.map((n) => '[' + n + ']').join('');
+  }
+  // 아무 인용도 못 붙였으면 숫자가 있는 첫 문장에 대표 출처를 단다
+  if (!lines.some((l) => /\[\d{1,2}\]$/.test(l.trim()))) {
+    for (let i = 0; i < lines.length; i++) {
+      if (/\d[\d,.]{1,}/.test(lines[i])) { lines[i] = lines[i].replace(/\s+$/, '') + ' [1]'; break; }
+    }
+  }
+  return lines.join('\n');
+}
+
+/* ── 출처 목록: 번호 + 접히는 스니펫 ── */
 function sourcesHtml(list) {
   const src = (list || state.turnSources || []).slice(0, 6);
   if (!src.length) return '';
   const uniq = [];
   const seen = new Set();
+  const normTitle = (t) => String(t || '')
+    .replace(/\s*[|\-–—:]\s*.*$/, '')   // "네이버 금융 | ..." → "네이버 금융"
+    .replace(/\s+/g, '')
+    .toLowerCase();
   for (const s of src) {
-    const key = (s.title || '') + '|' + (s.url || '');
-    if (!s.url || seen.has(s.url) || seen.has(key)) continue;
+    if (!s.url) continue;
+    const tk = normTitle(s.title);
+    if (seen.has(s.url) || (tk && seen.has('t:' + tk))) continue;
     seen.add(s.url);
-    seen.add(key);
+    if (tk) seen.add('t:' + tk);
     uniq.push(s);
   }
   if (!uniq.length) return '';
-  const items = uniq.map((s, i) =>
-    '<li><span class="cite-num">' + (i + 1) + '</span>' +
-    '<a href="' + escapeHtml(s.url) + '" target="_blank" rel="noreferrer">' +
-    escapeHtml(s.title || s.url) + '</a></li>').join('');
+
+  const items = uniq.map((s, i) => {
+    const snippet = s.snippet ? escapeHtml(s.snippet.slice(0, 220)) : '';
+    const head = '<span class="cite-num">' + (i + 1) + '</span>' +
+      '<a href="' + escapeHtml(s.url) + '" target="_blank" rel="noreferrer">' +
+      escapeHtml(s.title || s.url) + '</a>';
+    return snippet
+      ? '<li><details><summary>' + head + '</summary><p>' + snippet + '</p></details></li>'
+      : '<li>' + head + '</li>';
+  }).join('');
+
   return '<div class="sources"><span>출처</span><ul>' + items + '</ul></div>';
 }
 
@@ -699,9 +811,27 @@ function stopListening() {
   if (state._rec && state._rec.stop) { try { state._rec.stop(); } catch (_) {} state._rec = null; }
 }
 
+function condenseForSpeech(text) {
+  // 대화 모드에서 긴 답변을 그대로 읽으면 듣기 힘들다 → 핵심 2~3문장만 읽는다
+  const plain = String(text)
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/\[\d{1,2}\]/g, '')
+    .replace(/^\s*[-*•]\s*/gm, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (plain.length <= 260) return plain;
+  const sentences = plain.split(/(?<=[.!?。])\s+/);
+  let out = '';
+  for (const s of sentences) {
+    if ((out + s).length > 240) break;
+    out += (out ? ' ' : '') + s;
+  }
+  if (!out) out = plain.slice(0, 220);
+  return out + ' 자세한 내용은 화면을 확인해 주세요.';
+}
+
 async function speak(text) {
-  const clean = text
-    .replace(/```[\s\S]*?```/g, ' 코드 블록 ')
+  const clean = condenseForSpeech(text)
     .replace(/[*_`#>]/g, '')
     .replace(/\s+/g, ' ')
     .trim();
