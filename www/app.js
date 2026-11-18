@@ -258,6 +258,8 @@ async function streamChat(userText) {
   state.turnSources = [];
   state.retried = false;
   state.abortForRetry = false;
+  state.effectiveModel = null;
+  state.usedFallback = false;
   return runTurn(session, 0);
 }
 
@@ -270,41 +272,66 @@ function reqHeaders() {
   };
 }
 
-/* ── 생성 반복(degeneration) 감지·정리 ── */
-function repetitionScore(text) {
+/* ── 생성 반복(degeneration) 감지 — 창(window) 기반 ──
+   짧은 텍스트에서 숫자가 겹치는 정도로는 오탐이 나서,
+   160자 창 안에서 6-gram이 4번 이상 반복될 때만 반복으로 본다. */
+const DEGEN_WINDOW = 160;
+const DEGEN_GRAM = 6;
+const DEGEN_LIMIT = 4;
+
+function degenerateScore(text) {
   const t = String(text);
-  if (t.length < 200) return 0;
-  const counts = new Map();
-  let max = 0;
-  for (let i = 0; i + 4 <= t.length; i++) {
-    const g = t.slice(i, i + 4);
-    const n = (counts.get(g) || 0) + 1;
-    counts.set(g, n);
-    if (n > max) max = n;
-    if (max >= 14) break;   // 이미 충분히 반복적
+  if (t.length < 260) return 0;
+  let best = 0;
+  for (let start = 0; start + DEGEN_WINDOW <= t.length; start += 30) {
+    const win = t.slice(start, start + DEGEN_WINDOW);
+    const counts = new Map();
+    for (let i = 0; i + DEGEN_GRAM <= win.length; i++) {
+      const g = win.slice(i, i + DEGEN_GRAM);
+      const n = (counts.get(g) || 0) + 1;
+      counts.set(g, n);
+      if (n > best) {
+        best = n;
+        if (best >= DEGEN_LIMIT) return best;
+      }
+    }
   }
-  return max;
+  return best;
 }
 
 function isDegenerate(text) {
-  return repetitionScore(text) >= 12;
+  return degenerateScore(text) >= DEGEN_LIMIT;
 }
 
-/** 반복이 시작되는 지점에서 잘라낸다 */
+/** 반복이 시작되는 지점에서 잘라낸다. 잘랐으면 점수를 함께 돌려준다. */
 function sanitizeReply(text) {
   const t = String(text);
-  if (t.length < 200) return { text: t, trimmed: false };
-  const seen = new Map();
-  for (let i = 0; i + 4 <= t.length; i++) {
-    const g = t.slice(i, i + 4);
-    const n = (seen.get(g) || 0) + 1;
-    seen.set(g, n);
-    if (n >= 6) {
-      const cut = Math.max(0, i - 120);
-      return { text: t.slice(0, cut).trim(), trimmed: true };
+  if (t.length < 260) return { text: t, trimmed: false, score: 0 };
+  for (let end = DEGEN_WINDOW; end <= t.length; end += 30) {
+    const win = t.slice(Math.max(0, end - DEGEN_WINDOW), end);
+    const counts = new Map();
+    for (let i = 0; i + DEGEN_GRAM <= win.length; i++) {
+      const g = win.slice(i, i + DEGEN_GRAM);
+      const n = (counts.get(g) || 0) + 1;
+      counts.set(g, n);
+      if (n >= DEGEN_LIMIT) {
+        const cut = Math.max(0, end - 140);
+        return { text: t.slice(0, cut).trim(), trimmed: true, score: n };
+      }
     }
   }
-  return { text: t, trimmed: false };
+  return { text: t, trimmed: false, score: degenerateScore(t) };
+}
+
+// 반복 응답이 재발하면 안정적인 모델로 자동 전환한다
+const STABLE_MODELS = ['glm-5.3', 'glm-5.2', 'deepseek-v4-pro', 'qwen3.8-max', 'kimi-k2.7-code'];
+
+function pickFallbackModel() {
+  const ids = state.models.map((m) => m.id);
+  for (const id of STABLE_MODELS) {
+    if (ids.includes(id) && id !== state.model) return id;
+  }
+  return null;
 }
 
 async function runTurn(session, round) {
@@ -325,7 +352,7 @@ async function runTurn(session, round) {
     );
   }
   const body = {
-    model: state.model,
+    model: state.effectiveModel || state.model,
     stream: true,
     temperature: state.retried ? 0.95 : 0.7,
     messages: [
@@ -386,11 +413,24 @@ async function runTurn(session, round) {
 function finishTurn(session, text, bubble) {
   bubble.classList.remove('cursor');
   const raw = (text || '').trim();
-  if (isDegenerate(raw) && !state.retried) {
-    state.retried = true;
-    bubble.remove();
-    setTimeout(() => runTurn(session, 0), 300);
-    return;
+  if (isDegenerate(raw)) {
+    if (!state.retried) {
+      state.retried = true;
+      bubble.remove();
+      setTimeout(() => runTurn(session, 0), 300);
+      return;
+    }
+    const fb = state.usedFallback ? null : pickFallbackModel();
+    if (fb) {
+      state.usedFallback = true;
+      state.effectiveModel = fb;
+      state.retried = false;
+      bubble.remove();
+      const name = (state.models.find((m) => m.id === fb) || {}).name || fb;
+      toast('응답이 반복되어 ' + name + '(으)로 다시 시도합니다', 3600);
+      setTimeout(() => runTurn(session, 0), 300);
+      return;
+    }
   }
   const san = sanitizeReply(raw);
   const body = san.text;
@@ -404,7 +444,7 @@ function finishTurn(session, text, bubble) {
     const src = collectSources(session);
     const cited = autoCite(body, src);
     bubble.innerHTML = renderMarkdown(cited, src) +
-      (san.trimmed ? '<div class="note">응답이 반복되어 일부만 표시했습니다.</div>' : '') +
+      (san.trimmed ? '<div class="note">응답이 반복되어 일부만 표시했습니다. (반복 ' + (san.score || 0) + '회 감지)</div>' : '') +
       sourcesHtml(src);
   } else {
     bubble.innerHTML = '<span class="thinking">응답이 비어 있습니다.</span>';
