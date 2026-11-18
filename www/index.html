@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="theme-color" content="#0c0d12" />
+<title>오픈코드 Go</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<!-- ─────────── 키 설정 화면 ─────────── -->
+<section id="setup" class="screen setup">
+  <div class="brand">
+    <div class="logo">◍</div>
+    <h1>오픈코드 Go</h1>
+    <p class="sub">OpenCode Go 모델과 한국어로 대화하세요</p>
+  </div>
+
+  <div class="field">
+    <label for="keyInput">API 키</label>
+    <div class="row">
+      <input id="keyInput" type="password" inputmode="text" autocomplete="off"
+             placeholder="oc_sk_..." spellcheck="false" />
+      <button id="toggleKey" class="ghost" type="button" aria-label="키 표시">보기</button>
+    </div>
+    <p class="hint">OpenCode 콘솔 → API 키에서 발급합니다. 키는 이 기기에만 저장됩니다.</p>
+  </div>
+
+  <div class="field">
+    <label for="baseInput">API 주소</label>
+    <input id="baseInput" type="url" spellcheck="false" />
+    <p class="hint">기본값은 OpenCode Go의 OpenAI 호환 엔드포인트입니다.</p>
+  </div>
+
+  <button id="saveKey" class="primary">저장하고 시작</button>
+  <p id="setupMsg" class="msg"></p>
+</section>
+
+<!-- ─────────── 대화 화면 ─────────── -->
+<section id="chat" class="screen chat hidden">
+  <header class="topbar">
+    <button id="pickModel" class="model-btn" type="button">
+      <span id="modelName">모델 선택</span>
+      <span class="caret">▾</span>
+    </button>
+    <div class="top-actions">
+      <button id="openSessions" class="icon-btn" type="button" title="대화 목록">☰</button>
+      <button id="toggleTalk" class="icon-btn" type="button" title="대화 모드" aria-pressed="false">◉</button>
+      <button id="openSettings" class="icon-btn" type="button" title="설정">⚙</button>
+    </div>
+  </header>
+
+  <div id="talkBanner" class="talk-banner hidden">
+    <span class="dot"></span><span id="talkText">대화 모드 — 말하면 자동으로 답합니다</span>
+  </div>
+
+  <main id="messages" class="messages" aria-live="polite">
+    <div class="empty" id="emptyState">
+      <div class="empty-logo">◍</div>
+      <p>무엇이든 물어보세요.</p>
+      <p class="empty-sub">마이크를 누르고 말하면 대화 모드로 이어집니다.</p>
+    </div>
+  </main>
+
+  <footer class="composer">
+    <button id="stop" class="stop hidden" type="button">■ 멈춤</button>
+    <div class="input-wrap">
+      <button id="mic" class="mic-btn" type="button" aria-label="음성 입력">🎙</button>
+      <textarea id="input" rows="1" placeholder="메시지를 입력하세요" enterkeyhint="send"></textarea>
+      <button id="send" class="send" type="button" aria-label="보내기">↑</button>
+    </div>
+  </footer>
+</section>
+
+<!-- ─────────── 모델 선택 시트 ─────────── -->
+<div id="sheetModel" class="sheet hidden">
+  <div class="sheet-inner">
+    <div class="sheet-head">
+      <h2>모델</h2>
+      <button class="ghost close-sheet" data-close="sheetModel">닫기</button>
+    </div>
+    <input id="modelSearch" class="search" placeholder="모델 검색" spellcheck="false" />
+    <div id="modelList" class="model-list"></div>
+  </div>
+</div>
+
+<!-- ─────────── 대화 목록 시트 ─────────── -->
+<div id="sheetSessions" class="sheet hidden">
+  <div class="sheet-inner">
+    <div class="sheet-head">
+      <h2>대화</h2>
+      <button class="ghost close-sheet" data-close="sheetSessions">닫기</button>
+    </div>
+    <button id="newChat" class="primary small" type="button">＋ 새 대화</button>
+    <div id="sessionList" class="model-list"></div>
+  </div>
+</div>
+
+<!-- ─────────── 설정 시트 ─────────── -->
+<div id="sheetSettings" class="sheet hidden">
+  <div class="sheet-inner">
+    <div class="sheet-head">
+      <h2>설정</h2>
+      <button class="ghost close-sheet" data-close="sheetSettings">닫기</button>
+    </div>
+
+    <div class="field">
+      <label for="setKey">API 키</label>
+      <div class="row">
+        <input id="setKey" type="password" spellcheck="false" autocomplete="off" />
+        <button id="setToggleKey" class="ghost" type="button">보기</button>
+      </div>
+    </div>
+
+    <div class="field">
+      <label for="setBase">API 주소</label>
+      <input id="setBase" type="url" spellcheck="false" />
+    </div>
+
+    <div class="field">
+      <label for="setRate">읽기 속도 <span id="rateVal">1.0×</span></label>
+      <input id="setRate" type="range" min="0.6" max="1.6" step="0.1" value="1" />
+    </div>
+
+    <div class="field">
+      <label class="switch-row">
+        <span>대화 모드에서 자동 재청취</span>
+        <input id="setAutoListen" type="checkbox" checked />
+      </label>
+      <label class="switch-row">
+        <span>응답 자동 읽기</span>
+        <input id="setAutoSpeak" type="checkbox" checked />
+      </label>
+    </div>
+
+    <div class="field">
+      <label for="setSystem">시스템 프롬프트</label>
+      <textarea id="setSystem" rows="3"></textarea>
+      <p class="hint">모든 대화에 적용됩니다. 비워두면 기본값을 씁니다.</p>
+    </div>
+
+    <button id="clearChat" class="danger">대화 기록 지우기</button>
+    <button id="saveSettings" class="primary">저장</button>
+    <p id="settingsMsg" class="msg"></p>
+  </div>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+
+<script src="app.js"></script>
+</body>
+</html>

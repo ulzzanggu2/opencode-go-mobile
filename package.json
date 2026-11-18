@@ -1,0 +1,19 @@
+{
+  "name": "ocgo-mobile",
+  "version": "1.0.0",
+  "private": true,
+  "description": "OpenCode Go 모바일 — 한국어 대화형 클라이언트",
+  "scripts": {
+    "add:android": "cap add android",
+    "sync": "cap sync android",
+    "open": "cap open android",
+    "apk": "cd android && ./gradlew assembleDebug"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^7.0.0"
+  },
+  "dependencies": {
+    "@capacitor/android": "^7.0.0",
+    "@capacitor/core": "^7.0.0"
+  }
+}

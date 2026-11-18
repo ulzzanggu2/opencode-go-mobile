@@ -1,0 +1,22 @@
+# 의존성
+node_modules/
+
+# 안드로이드 빌드 산출물
+android/app/build/
+android/build/
+android/.gradle/
+android/capacitor-cordova-android-plugins/build/
+android/app/src/main/assets/public/
+
+# 서명 키 — 절대 커밋 금지
+android/keystore.properties
+android/keystore/
+*.jks
+*.keystore
+
+# 로컬 환경
+android/local.properties
+dist/
+
+# OS
+.DS_Store
