@@ -11,6 +11,7 @@ public class MainActivity extends BridgeActivity {
         // 플러그인은 super.onCreate 이전에 등록해야 브리지에 연결된다.
         registerPlugin(OcStreamPlugin.class);
         registerPlugin(OcSpeechPlugin.class);
+        registerPlugin(OcWebPlugin.class);
         super.onCreate(savedInstanceState);
     }
 }

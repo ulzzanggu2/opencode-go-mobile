@@ -16,6 +16,7 @@ const LS = {
   autoListen: 'ocgo.autoListen',
   autoSpeak: 'ocgo.autoSpeak',
   talk: 'ocgo.talk',
+  webSearch: 'ocgo.webSearch',
   sessions: 'ocgo.sessions',
   active: 'ocgo.active',
 };
@@ -29,6 +30,7 @@ const state = {
   autoListen: localStorage.getItem(LS.autoListen) !== '0',
   autoSpeak: localStorage.getItem(LS.autoSpeak) !== '0',
   talk: localStorage.getItem(LS.talk) === '1',
+  webSearch: localStorage.getItem(LS.webSearch) !== '0',
   models: [],
   sessions: [],        // [{id, title, model, messages:[{role,content}], updatedAt}]
   activeId: localStorage.getItem(LS.active) || '',
@@ -72,6 +74,7 @@ function persist() {
   localStorage.setItem(LS.autoListen, state.autoListen ? '1' : '0');
   localStorage.setItem(LS.autoSpeak, state.autoSpeak ? '1' : '0');
   localStorage.setItem(LS.talk, state.talk ? '1' : '0');
+  localStorage.setItem(LS.webSearch, state.webSearch ? '1' : '0');
 }
 
 function loadSessions() {
@@ -182,7 +185,43 @@ function explainError(msg) {
   return m;
 }
 
-/* ─────────── 스트리밍 ─────────── */
+/* ─────────── 스트리밍 + 웹 검색 도구 ─────────── */
+
+// 모델에게 제공하는 도구 정의 (무료 검색만 사용)
+const TOOLS = [
+  {
+    type: 'function',
+    function: {
+      name: 'web_search',
+      description:
+        '인터넷에서 최신 정보를 검색합니다. 날씨, 환율, 뉴스, 최신 버전, 실시간 수치처럼 ' +
+        '학습 시점 이후 달라졌을 수 있는 내용은 반드시 이 도구를 사용하세요.',
+      parameters: {
+        type: 'object',
+        properties: { query: { type: 'string', description: '검색어 (한국어 가능)' } },
+        required: ['query'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'open_url',
+      description: '검색 결과 중 특정 페이지의 본문을 읽습니다. 자세한 내용이 필요할 때 사용하세요.',
+      parameters: {
+        type: 'object',
+        properties: { url: { type: 'string', description: 'http(s) 주소' } },
+        required: ['url'],
+      },
+    },
+  },
+];
+
+function toolsAvailable() {
+  const web = cap().OcWeb;
+  return state.webSearch && !!web;
+}
+
 async function streamChat(userText) {
   const session = ensureSession();
   session.messages.push({ role: 'user', content: userText });
@@ -191,80 +230,246 @@ async function streamChat(userText) {
   session.updatedAt = Date.now();
   persistSessions();
   renderMessage('user', userText);
+  toast._sources = [];
+  return runTurn(session, 0);
+}
 
-  const bubble = renderMessage('assistant', '');
-  bubble.classList.add('cursor');
-  state.currentBubble = bubble;
-  state.currentText = '';
-  state.streaming = true;
-  setBusy(true);
-
-  const body = {
-    model: state.model,
-    stream: true,
-    messages: [
-      ...(state.system ? [{ role: 'system', content: state.system }] : []),
-      ...session.messages.slice(-20),
-    ],
-  };
-  const url = state.base.replace(/\/$/, '') + '/chat/completions';
-  const headers = {
+function reqHeaders() {
+  return {
     'Content-Type': 'application/json',
     Authorization: 'Bearer ' + state.key,
     'x-opencode-session': state.sessionId,
     'User-Agent': 'ocgo-mobile/1.0 (android)',
   };
+}
 
-  const onDelta = (t) => {
-    state.currentText += t;
-    bubble.innerHTML = renderMarkdown(state.currentText);
-    scrollBottom();
-  };
-  const finish = () => {
-    bubble.classList.remove('cursor');
-    const text = state.currentText;
-    if (text.trim()) {
-      session.messages.push({ role: 'assistant', content: text });
-      session.updatedAt = Date.now();
-      persistSessions();
-    } else {
-      bubble.innerHTML = '<span class="thinking">응답이 비어 있습니다.</span>';
-    }
-    state.streaming = false;
-    setBusy(false);
-    maybeSpeak(text);
-  };
-  const fail = (msg) => {
-    bubble.classList.remove('cursor');
-    bubble.innerHTML = '<span class="thinking">' + escapeHtml(explainError(msg)) + '</span>';
-    state.streaming = false;
-    setBusy(false);
-    voiceIdle();
-    if (/HTTP 40[13]/.test(String(msg))) toast('설정에서 API 키를 확인하세요', 3200);
-  };
+async function runTurn(session, round) {
+  const bubble = renderMessage('assistant', '');
+  bubble.classList.add('cursor');
+  state.currentText = '';
+  state.streaming = true;
+  setBusy(true);
 
+  const useTools = toolsAvailable() && round < 2;
+  const sys = [state.system];
+  if (useTools) {
+    sys.push(
+      '실시간 정보(환율, 주가, 날씨, 뉴스, 최신 버전·가격, 오늘 날짜 기준 사실)를 물으면 ' +
+      '반드시 web_search 도구를 먼저 호출해 결과를 확인한 뒤 답하세요. ' +
+      '검색 결과 없이 추측해서 수치를 말하지 마세요. 결과가 부족하면 open_url로 본문을 확인하세요.'
+    );
+  }
+  const body = {
+    model: state.model,
+    stream: true,
+    messages: [
+      ...(sys.filter(Boolean).length ? [{ role: 'system', content: sys.filter(Boolean).join('\n\n') }] : []),
+      ...session.messages.slice(-24),
+    ],
+  };
+  if (useTools) body.tools = TOOLS;
+
+  const url = state.base.replace(/\/$/, '') + '/chat/completions';
+  const headers = reqHeaders();
   const ns = nativeStream();
-  if (ns) {
+
+  if (!ns) return browserFallback(url, headers, body, bubble, session);
+
+  await new Promise((resolve) => {
     let cleanup = () => {};
-    try {
-      const l1 = await ns.addListener('delta', (e) => onDelta(e.text || ''));
-      const l2 = await ns.addListener('done', () => { finish(); cleanup(); });
-      const l3 = await ns.addListener('error', (e) => { fail(e.message || '알 수 없는 오류'); cleanup(); });
-      cleanup = () => { l1 && l1.remove(); l2 && l2.remove(); l3 && l3.remove(); };
-      await ns.start({ url, headers, body: JSON.stringify(body) });
-    } catch (e) {
-      fail(e.message || String(e));
+    let settled = false;
+    const settle = () => { if (settled) return; settled = true; cleanup(); resolve(); };
+
+    (async () => {
+      const l1 = await ns.addListener('delta', (e) => {
+        state.currentText += e.text || '';
+        bubble.innerHTML = renderMarkdown(state.currentText);
+        scrollBottom();
+      });
+      const l2 = await ns.addListener('toolcalls', async (e) => {
+        try { await handleToolCalls(session, round, e, bubble); } catch (err) { failTurn(bubble, String(err)); }
+        settle();
+      });
+      const l3 = await ns.addListener('done', (e) => {
+        finishTurn(session, (e && e.text) || state.currentText, bubble);
+        settle();
+      });
+      const l4 = await ns.addListener('error', (e) => {
+        failTurn(bubble, (e && e.message) || '알 수 없는 오류');
+        settle();
+      });
+      cleanup = () => { l1 && l1.remove(); l2 && l2.remove(); l3 && l3.remove(); l4 && l4.remove(); };
+      try {
+        await ns.start({ url, headers, body: JSON.stringify(body) });
+      } catch (err) {
+        failTurn(bubble, err.message || String(err));
+        settle();
+      }
+    })();
+  });
+}
+
+function finishTurn(session, text, bubble) {
+  bubble.classList.remove('cursor');
+  const body = (text || '').trim();
+  if (body) {
+    session.messages.push({ role: 'assistant', content: body });
+    session.updatedAt = Date.now();
+    persistSessions();
+    bubble.innerHTML = renderMarkdown(body) + sourcesHtml();
+  } else {
+    bubble.innerHTML = '<span class="thinking">응답이 비어 있습니다.</span>';
+  }
+  state.streaming = false;
+  setBusy(false);
+  maybeSpeak(body);
+}
+
+function failTurn(bubble, msg) {
+  bubble.classList.remove('cursor');
+  bubble.innerHTML = '<span class="thinking">' + escapeHtml(explainError(msg)) + '</span>';
+  state.streaming = false;
+  setBusy(false);
+  voiceIdle();
+  if (/HTTP 40[13]/.test(String(msg))) toast('설정에서 API 키를 확인하세요', 3200);
+}
+
+/* ── 도구 실행 ── */
+function toolLine(name, args) {
+  const row = document.createElement('div');
+  row.className = 'tool-line';
+  const label = name === 'web_search'
+    ? '🔍 검색 중: ' + (args.query || '')
+    : '📄 읽는 중: ' + (args.url || '').slice(0, 60);
+  row.textContent = label;
+  $('messages').appendChild(row);
+  scrollBottom(true);
+  return {
+    update(result) {
+      if (result && result.error) {
+        row.textContent = label.replace('검색 중', '검색 실패').replace('읽는 중', '읽기 실패');
+        row.classList.add('failed');
+        return;
+      }
+      if (name === 'web_search') {
+        const n = (result && result.results ? result.results.length : 0);
+        row.textContent = '🔍 ' + (args.query || '') + ' — 결과 ' + n + '건' +
+          (result && result.source === 'wikipedia' ? ' (위키백과)' : '');
+      } else {
+        row.textContent = '📄 ' + (result && result.title ? result.title : (args.url || '')).slice(0, 70);
+      }
+    },
+  };
+}
+
+async function execTool(name, args) {
+  const web = cap().OcWeb;
+  if (!web) return { error: '검색 기능을 사용할 수 없습니다' };
+  if (name === 'web_search') {
+    const res = await web.search({ query: String(args.query || ''), limit: 5 });
+    const list = (res && res.results) || [];
+    if (list.length) {
+      toast._sources = (toast._sources || []).concat(list.map((r) => ({ title: r.title, url: r.url })));
     }
-    return;
+    return {
+      source: (res && res.source) || 'duckduckgo',
+      results: list.map((r) => ({ title: r.title, url: r.url, snippet: r.snippet })),
+    };
+  }
+  if (name === 'open_url') {
+    const res = await web.fetchPage({ url: String(args.url || '') });
+    return { title: res.title, url: res.url, text: (res.text || '').slice(0, 2500) };
+  }
+  return { error: '알 수 없는 도구: ' + name };
+}
+
+async function handleToolCalls(session, round, e, bubble) {
+  bubble.classList.remove('cursor');
+  const text = e.text || '';
+  if (text.trim()) bubble.innerHTML = renderMarkdown(text);
+
+  const raw = (e.calls || []).filter((c) => c && c.function && c.function.name);
+  // 같은 이름·같은 인자의 중복 호출은 한 번만 실행한다
+  const seenCalls = new Set();
+  const calls = raw.filter((c) => {
+    const key = c.function.name + '|' + (c.function.arguments || '');
+    if (seenCalls.has(key)) return false;
+    seenCalls.add(key);
+    return true;
+  });
+  if (!calls.length) { finishTurn(session, text, bubble); return; }
+
+  // assistant 메시지에 도구 호출을 기록
+  session.messages.push({
+    role: 'assistant',
+    content: text || '',
+    tool_calls: calls.map((c) => ({
+      id: c.id || 'call_' + Math.random().toString(16).slice(2),
+      type: 'function',
+      function: { name: c.function.name, arguments: c.function.arguments || '{}' },
+    })),
+  });
+
+  for (const call of calls) {
+    let args = {};
+    try { args = JSON.parse(call.function.arguments || '{}'); } catch (_) {}
+    const line = toolLine(call.function.name, args);
+    let result;
+    try {
+      result = await execTool(call.function.name, args);
+    } catch (err) {
+      result = { error: String((err && err.message) || err) };
+    }
+    line.update(result);
+    session.messages.push({
+      role: 'tool',
+      tool_call_id: call.id || 'call_unknown',
+      content: JSON.stringify(result).slice(0, 6000),
+    });
   }
 
-  // 브라우저 폴백 (CORS 허용 시)
+  session.updatedAt = Date.now();
+  persistSessions();
+  if (call0EmptyText(bubble, text)) bubble.remove();
+  // 이전 스트림 스레드가 완전히 끝난 뒤 다음 라운드를 시작한다
+  await new Promise((r) => setTimeout(r, 250));
+  await runTurn(session, round + 1);
+}
+
+function call0EmptyText(bubble, text) {
+  return !text || !text.trim();
+}
+
+function sourcesHtml() {
+  const src = (toast._sources || []).slice(0, 5);
+  if (!src.length) return '';
+  const uniq = [];
+  const seen = new Set();
+  for (const s of src) {
+    const key = (s.title || '') + '|' + (s.url || '');
+    if (!s.url || seen.has(s.url) || seen.has(key)) continue;
+    seen.add(s.url);
+    seen.add(key);
+    uniq.push(s);
+  }
+  if (!uniq.length) return '';
+  const items = uniq.map((s) =>
+    '<li><a href="' + escapeHtml(s.url) + '" target="_blank" rel="noreferrer">' +
+    escapeHtml(s.title || s.url) + '</a></li>').join('');
+  return '<div class="sources"><span>출처</span><ul>' + items + '</ul></div>';
+}
+
+/* ── 브라우저 폴백 (도구 없이) ── */
+async function browserFallback(url, headers, body, bubble, session) {
+  const plain = { ...body };
+  delete plain.tools;
   try {
-    const res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body) });
+    const res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(plain) });
     if (!res.ok) throw new Error('HTTP ' + res.status + ' ' + (await res.text()).slice(0, 200));
     const reader = res.body.getReader();
     const dec = new TextDecoder();
     let buf = '';
+    let text = '';
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
@@ -279,13 +484,17 @@ async function streamChat(userText) {
         try {
           const j = JSON.parse(payload);
           const d = j.choices && j.choices[0] && j.choices[0].delta;
-          if (d && d.content) onDelta(d.content);
+          if (d && d.content) {
+            text += d.content;
+            bubble.innerHTML = renderMarkdown(text);
+            scrollBottom();
+          }
         } catch (_) {}
       }
     }
-    finish();
+    finishTurn(session, text, bubble);
   } catch (e) {
-    fail(e.message || String(e));
+    failTurn(bubble, e.message || String(e));
   }
 }
 
@@ -651,6 +860,7 @@ function bind() {
     $('rateVal').textContent = state.rate.toFixed(1) + '×';
     $('setAutoListen').checked = state.autoListen;
     $('setAutoSpeak').checked = state.autoSpeak;
+    $('setWebSearch').checked = state.webSearch;
     $('setSystem').value = state.system;
     $('sheetSettings').classList.remove('hidden');
   };
@@ -661,6 +871,7 @@ function bind() {
     state.rate = parseFloat($('setRate').value) || 1;
     state.autoListen = $('setAutoListen').checked;
     state.autoSpeak = $('setAutoSpeak').checked;
+    state.webSearch = $('setWebSearch').checked;
     state.system = $('setSystem').value;
     persist();
     closeSheet('sheetSettings');
@@ -736,6 +947,10 @@ function bind() {
     renderActiveSession();
     loadModels();
     checkVoice();
+    // 검색 플러그인이 없으면 조용히 경고
+    setTimeout(() => {
+      if (state.webSearch && !cap().OcWeb) toast('웹 검색을 사용할 수 없습니다', 3000);
+    }, 1200);
   } else {
     showSetup();
   }

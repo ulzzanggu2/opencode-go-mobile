@@ -67,9 +67,12 @@ public class OcStreamPlugin extends Plugin {
         cancelCurrent();
 
         worker = new Thread(() -> {
+            final Call myCall = client.newCall(request);
+            synchronized (OcStreamPlugin.this) {
+                currentCall = myCall;
+            }
             try {
-                currentCall = client.newCall(request);
-                Response response = currentCall.execute();
+                Response response = myCall.execute();
                 if (!response.isSuccessful()) {
                     ResponseBody eb = response.body();
                     String detail = eb != null ? eb.string() : "";
@@ -82,27 +85,91 @@ public class OcStreamPlugin extends Plugin {
                 BufferedReader reader = new BufferedReader(new InputStreamReader(rb2.byteStream(), "UTF-8"));
                 String line;
                 StringBuilder acc = new StringBuilder();
+                java.util.LinkedHashMap<Integer, JSONObject> toolAcc = new java.util.LinkedHashMap<>();
+                String finishReason = null;
                 while ((line = reader.readLine()) != null) {
                     String s = line.trim();
                     if (s.isEmpty() || !s.startsWith("data:")) continue;
                     String payload = s.substring(5).trim();
                     if (payload.equals("[DONE]")) break;
-                    String delta = extractDelta(payload);
-                    if (delta != null && !delta.isEmpty()) {
-                        acc.append(delta);
-                        JSObject out = new JSObject();
-                        out.put("text", delta);
-                        notifyListeners("delta", out);
+                    try {
+                        JSONObject json = new JSONObject(payload);
+                        JSONArray choices = json.optJSONArray("choices");
+                        if (choices == null || choices.length() == 0) continue;
+                        JSONObject choice = choices.optJSONObject(0);
+                        if (choice == null) continue;
+
+                        String fr = choice.optString("finish_reason", "");
+                        if (!fr.isEmpty() && !fr.equals("null")) finishReason = fr;
+
+                        JSONObject delta = choice.optJSONObject("delta");
+                        if (delta == null) continue;
+
+                        if (delta.has("content") && !delta.isNull("content")) {
+                            String t = delta.optString("content", "");
+                            if (!t.isEmpty()) {
+                                acc.append(t);
+                                JSObject out = new JSObject();
+                                out.put("text", t);
+                                notifyListeners("delta", out);
+                            }
+                        }
+
+                        // 도구 호출은 조각조각 흘러오므로 index 기준으로 누적한다
+                        JSONArray tcs = delta.optJSONArray("tool_calls");
+                        if (tcs != null) {
+                            for (int i = 0; i < tcs.length(); i++) {
+                                JSONObject c = tcs.optJSONObject(i);
+                                if (c == null) continue;
+                                int idx = c.optInt("index", i);
+                                JSONObject cur = toolAcc.get(idx);
+                                if (cur == null) {
+                                    cur = new JSONObject();
+                                    cur.put("index", idx);
+                                    toolAcc.put(idx, cur);
+                                }
+                                if (c.has("id")) cur.put("id", c.optString("id"));
+                                if (c.has("type")) cur.put("type", c.optString("type"));
+                                JSONObject fn = c.optJSONObject("function");
+                                if (fn != null) {
+                                    JSONObject curFn = cur.optJSONObject("function");
+                                    if (curFn == null) curFn = new JSONObject();
+                                    if (fn.has("name")) curFn.put("name", fn.optString("name"));
+                                    if (fn.has("arguments")) {
+                                        curFn.put("arguments", curFn.optString("arguments", "") + fn.optString("arguments", ""));
+                                    }
+                                    cur.put("function", curFn);
+                                }
+                            }
+                        }
+                    } catch (Exception ignore) {
+                        // 조각이 잘린 경우 등은 건너뛴다
                     }
                 }
                 reader.close();
 
-                JSObject done = new JSObject();
-                done.put("text", acc.toString());
-                notifyListeners("done", done);
+                if (!toolAcc.isEmpty()) {
+                    JSONArray calls = new JSONArray();
+                    for (JSONObject c : toolAcc.values()) calls.put(c);
+                    JSObject out = new JSObject();
+                    out.put("calls", calls);
+                    out.put("text", acc.toString());
+                    out.put("finishReason", finishReason == null ? "" : finishReason);
+                    notifyListeners("toolcalls", out);
+                } else {
+                    JSObject done = new JSObject();
+                    done.put("text", acc.toString());
+                    done.put("finishReason", finishReason == null ? "" : finishReason);
+                    notifyListeners("done", done);
+                }
             } catch (Exception e) {
-                if (currentCall == null || !currentCall.isCanceled()) {
+                // 이 스레드의 호출만 확인한다 (다음 라운드가 currentCall을 교체해도 영향 없음)
+                if (!myCall.isCanceled()) {
                     notifyError(e.getMessage() == null ? e.toString() : e.getMessage());
+                }
+            } finally {
+                synchronized (OcStreamPlugin.this) {
+                    if (currentCall == myCall) currentCall = null;
                 }
             }
         });
@@ -117,10 +184,14 @@ public class OcStreamPlugin extends Plugin {
     }
 
     private void cancelCurrent() {
+        Call c;
+        synchronized (this) {
+            c = currentCall;
+            currentCall = null;
+        }
         try {
-            if (currentCall != null) currentCall.cancel();
+            if (c != null) c.cancel();
         } catch (Exception ignored) {}
-        currentCall = null;
     }
 
     private void notifyError(String message) {
