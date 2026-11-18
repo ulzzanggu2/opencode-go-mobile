@@ -41,6 +41,7 @@ const state = {
   currentBubble: null,
   currentText: '',
   ttsReady: null,
+  turnSources: [],
 };
 
 const $ = (id) => document.getElementById(id);
@@ -217,6 +218,23 @@ const TOOLS = [
   },
 ];
 
+// 검색 결과 캐시 (10분) — 같은 질문 반복 시 DDG 부하와 차단 위험을 줄인다
+const searchCache = new Map();
+const pageCache = new Map();
+const CACHE_TTL = 10 * 60 * 1000;
+
+function cacheGet(map, key) {
+  const hit = map.get(key);
+  if (!hit) return null;
+  if (Date.now() - hit.ts > CACHE_TTL) { map.delete(key); return null; }
+  return hit.data;
+}
+
+function cacheSet(map, key, data) {
+  map.set(key, { ts: Date.now(), data });
+  if (map.size > 40) map.delete(map.keys().next().value);
+}
+
 function toolsAvailable() {
   const web = cap().OcWeb;
   return state.webSearch && !!web;
@@ -230,7 +248,7 @@ async function streamChat(userText) {
   session.updatedAt = Date.now();
   persistSessions();
   renderMessage('user', userText);
-  toast._sources = [];
+  state.turnSources = [];
   return runTurn(session, 0);
 }
 
@@ -256,7 +274,8 @@ async function runTurn(session, round) {
     sys.push(
       '실시간 정보(환율, 주가, 날씨, 뉴스, 최신 버전·가격, 오늘 날짜 기준 사실)를 물으면 ' +
       '반드시 web_search 도구를 먼저 호출해 결과를 확인한 뒤 답하세요. ' +
-      '검색 결과 없이 추측해서 수치를 말하지 마세요. 결과가 부족하면 open_url로 본문을 확인하세요.'
+      '검색 결과 없이 추측해서 수치를 말하지 마세요. 결과가 부족하면 open_url로 본문을 확인하세요. ' +
+      '검색 결과를 근거로 답할 때는 문장 끝에 [1], [2]처럼 결과 번호를 붙여 인용하세요.'
     );
   }
   const body = {
@@ -283,7 +302,7 @@ async function runTurn(session, round) {
     (async () => {
       const l1 = await ns.addListener('delta', (e) => {
         state.currentText += e.text || '';
-        bubble.innerHTML = renderMarkdown(state.currentText);
+        bubble.innerHTML = renderMarkdown(state.currentText, state.turnSources);
         scrollBottom();
       });
       const l2 = await ns.addListener('toolcalls', async (e) => {
@@ -316,7 +335,8 @@ function finishTurn(session, text, bubble) {
     session.messages.push({ role: 'assistant', content: body });
     session.updatedAt = Date.now();
     persistSessions();
-    bubble.innerHTML = renderMarkdown(body) + sourcesHtml();
+    const src = collectSources(session);
+    bubble.innerHTML = renderMarkdown(body, src) + sourcesHtml(src);
   } else {
     bubble.innerHTML = '<span class="thinking">응답이 비어 있습니다.</span>';
   }
@@ -365,20 +385,36 @@ function toolLine(name, args) {
 async function execTool(name, args) {
   const web = cap().OcWeb;
   if (!web) return { error: '검색 기능을 사용할 수 없습니다' };
+
   if (name === 'web_search') {
-    const res = await web.search({ query: String(args.query || ''), limit: 5 });
-    const list = (res && res.results) || [];
-    if (list.length) {
-      toast._sources = (toast._sources || []).concat(list.map((r) => ({ title: r.title, url: r.url })));
+    const query = String(args.query || '').trim();
+    let data = cacheGet(searchCache, query);
+    if (!data) {
+      const res = await web.search({ query, limit: 5 });
+      data = { source: (res && res.source) || 'duckduckgo', results: ((res && res.results) || []) };
+      if (data.results.length) cacheSet(searchCache, query, data);
     }
-    return {
-      source: (res && res.source) || 'duckduckgo',
-      results: list.map((r) => ({ title: r.title, url: r.url, snippet: r.snippet })),
-    };
+    // 출처 번호를 매겨 모델이 [1], [2]로 인용할 수 있게 한다
+    const results = data.results.map((r) => {
+      let n = state.turnSources.findIndex((x) => x.url === r.url);
+      if (n < 0) {
+        state.turnSources.push({ title: r.title, url: r.url });
+        n = state.turnSources.length - 1;
+      }
+      return { n: n + 1, title: r.title, url: r.url, snippet: r.snippet };
+    });
+    return { source: data.source, results, cached: !!cacheGet(searchCache, query) };
   }
+
   if (name === 'open_url') {
-    const res = await web.fetchPage({ url: String(args.url || '') });
-    return { title: res.title, url: res.url, text: (res.text || '').slice(0, 2500) };
+    const url = String(args.url || '');
+    let data = cacheGet(pageCache, url);
+    if (!data) {
+      const res = await web.fetchPage({ url });
+      data = { title: res.title, url: res.url, text: (res.text || '').slice(0, 2500) };
+      if (data.text) cacheSet(pageCache, url, data);
+    }
+    return data;
   }
   return { error: '알 수 없는 도구: ' + name };
 }
@@ -410,6 +446,8 @@ async function handleToolCalls(session, round, e, bubble) {
     })),
   });
 
+  let searchFailures = 0;
+  let searchAttempts = 0;
   for (const call of calls) {
     let args = {};
     try { args = JSON.parse(call.function.arguments || '{}'); } catch (_) {}
@@ -420,6 +458,10 @@ async function handleToolCalls(session, round, e, bubble) {
     } catch (err) {
       result = { error: String((err && err.message) || err) };
     }
+    if (call.function.name === 'web_search') {
+      searchAttempts++;
+      if (result && result.error) searchFailures++;
+    }
     line.update(result);
     session.messages.push({
       role: 'tool',
@@ -428,6 +470,9 @@ async function handleToolCalls(session, round, e, bubble) {
     });
   }
 
+  if (searchAttempts && searchFailures === searchAttempts) {
+    toast('검색에 실패했습니다 — 아는 범위에서 답합니다', 3200);
+  }
   session.updatedAt = Date.now();
   persistSessions();
   if (call0EmptyText(bubble, text)) bubble.remove();
@@ -440,8 +485,26 @@ function call0EmptyText(bubble, text) {
   return !text || !text.trim();
 }
 
-function sourcesHtml() {
-  const src = (toast._sources || []).slice(0, 5);
+function collectSources(session) {
+  const out = [];
+  const seen = new Set();
+  const msgs = (session && session.messages ? session.messages : []).slice(-14);
+  for (const m of msgs) {
+    if (m.role !== 'tool' || !m.content) continue;
+    try {
+      const j = JSON.parse(m.content);
+      for (const r of (j.results || [])) {
+        if (!r || !r.url || seen.has(r.url)) continue;
+        seen.add(r.url);
+        out.push({ title: r.title || r.url, url: r.url });
+      }
+    } catch (_) {}
+  }
+  return out;
+}
+
+function sourcesHtml(list) {
+  const src = (list || state.turnSources || []).slice(0, 6);
   if (!src.length) return '';
   const uniq = [];
   const seen = new Set();
@@ -453,8 +516,9 @@ function sourcesHtml() {
     uniq.push(s);
   }
   if (!uniq.length) return '';
-  const items = uniq.map((s) =>
-    '<li><a href="' + escapeHtml(s.url) + '" target="_blank" rel="noreferrer">' +
+  const items = uniq.map((s, i) =>
+    '<li><span class="cite-num">' + (i + 1) + '</span>' +
+    '<a href="' + escapeHtml(s.url) + '" target="_blank" rel="noreferrer">' +
     escapeHtml(s.title || s.url) + '</a></li>').join('');
   return '<div class="sources"><span>출처</span><ul>' + items + '</ul></div>';
 }
@@ -525,7 +589,7 @@ function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
-function renderMarkdown(src) {
+function renderMarkdown(src, cite) {
   const blocks = [];
   let text = escapeHtml(src).replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) => {
     blocks.push('<pre><code>' + code.replace(/\n$/, '') + '</code></pre>');
@@ -540,6 +604,14 @@ function renderMarkdown(src) {
     .replace(/^\s*[-*] (.*)$/gm, '• $1')
     .replace(/\[([^\]]+)\]\((https?:[^)]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>');
   text = text.replace(/\u0000B(\d+)\u0000/g, (_, i) => blocks[+i]);
+  // [1], [2] 인용을 출처 링크로 바꾼다
+  if (cite && cite.length) {
+    text = text.replace(/\[(\d{1,2})\]/g, (m, n) => {
+      const src = cite[Number(n) - 1];
+      if (!src) return m;
+      return '<a class="cite" href="' + escapeHtml(src.url) + '" target="_blank" rel="noreferrer">[' + n + ']</a>';
+    });
+  }
   return text;
 }
 

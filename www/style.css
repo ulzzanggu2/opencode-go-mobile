@@ -309,3 +309,15 @@ input[type="range"] { padding: 0; background: none; border: none; accent-color: 
 .sources li { margin: 2px 0; }
 .sources a { color: var(--accent); text-decoration: none; }
 .hint-inline { font-size: 11px; color: var(--muted); }
+
+/* ── 인라인 인용 ── */
+.bubble a.cite {
+  color: var(--accent); text-decoration: none; font-size: 11px;
+  vertical-align: super; padding: 0 1px; font-weight: 700;
+}
+.sources li { display: flex; gap: 6px; align-items: baseline; }
+.cite-num {
+  flex: none; display: inline-block; min-width: 16px; height: 16px;
+  border-radius: 4px; background: rgba(76,217,168,.14); color: var(--accent);
+  font-size: 10px; font-weight: 700; text-align: center; line-height: 16px;
+}
